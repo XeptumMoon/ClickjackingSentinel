@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<style>
+  body {
+    font-family: system-ui, sans-serif;
+    width: 340px;
+    margin: 0;
+    padding: 12px;
+    color: #222;
+  }
+  h1 { font-size: 1rem; margin: 0 0 10px; }
+  .alert {
+    border-left: 4px solid #c62828;
+    background: #fff5f5;
+    padding: 8px 10px;
+    margin-bottom: 8px;
+    border-radius: 4px;
+    font-size: 0.8rem;
+  }
+  .alert .human-msg { font-size: 0.85rem; font-weight: 600; color: #7a0000; margin-bottom: 4px; }
+  .alert .meta { font-size: 0.7rem; color: #777; }
+  .alert details { margin-top: 6px; }
+  .alert summary { font-size: 0.7rem; color: #1565c0; cursor: pointer; }
+  .breakdown { font-family: monospace; font-size: 0.7rem; color: #555; margin-top: 4px; }
+  .empty { color: #777; font-size: 0.85rem; }
+  .locate-btn {
+    display: block;
+    width: 100%;
+    margin-top: 8px;
+    padding: 6px 8px;
+    border: 1px solid #c62828;
+    border-radius: 4px;
+    background: #fff;
+    color: #7a0000;
+    font-size: 0.75rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .locate-btn:hover:not(:disabled) {
+    background: #ffebee;
+  }
+  .locate-btn:disabled {
+    opacity: 0.7;
+    cursor: default;
+  }
+</style>
+</head>
+<body>
+  <h1>Clickjack Sentinel — alertas en esta pestaña</h1>
+  <div id="list"><div class="empty">Cargando…</div></div>
+  <script src="popup.js"></script>
+</body>
+</html>
