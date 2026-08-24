@@ -1,5 +1,5 @@
 /**
- * Clickjack Sentinel — content script
+ * Clickjack Sentinel Modificado
  *
  * Arquitectura: cada elemento potencialmente clickeable (<a href>, [onclick],
  * role="button", <button>, <iframe>) se evalúa contra 5 heurísticas.
@@ -15,8 +15,9 @@ function main() {
 
   const CONFIG = {
     SUSPICION_THRESHOLD: 0.55,
+    // Un valor <= esto se considera casi invisible.
     OPACITY_SUSPECT_MAX: 0.15, // opacidad por debajo de esto = sospechoso
-    SAMPLE_POINTS: 5, // puntos muestreados dentro del bounding box
+    SAMPLE_GRID_SIZE: 3, // Rejilla de muestreo espacial.
     MOUSE_FOLLOW_CORR_WINDOW: 12, // muestras de mousemove para medir correlación
     TRANSACTIONAL_WINDOW_MS: 1200, // ventana para detectar aparición/desaparición rápida
     WEIGHTS: {
@@ -26,6 +27,9 @@ function main() {
       mouseFollowing: 0.15, // elemento cuya posición correlaciona con el cursor
       semanticMismatch: 0.1, // texto ancla no relacionado con el dominio del href
     },
+    // Patrones que consideramos suficientemente fuertes por sí solos.
+    STRONG_SHADOW_THRESHOLD: 0.45,
+    STRONG_LOW_OPACITY_THRESHOLD: 0.7,
   };
 
   const mouseTrail = []; // {x, y, t}
@@ -46,7 +50,8 @@ function main() {
 
   function getOpacity(el) {
     const cs = getComputedStyle(el);
-    return parseFloat(cs.opacity);
+    const value = parseFloat(cs.opacity);
+    return Number.isFinite(value) ? value : 1;
   }
 
   function isPointerActive(el) {
@@ -58,6 +63,39 @@ function main() {
     );
   }
 
+  /**
+   * Genera una rejilla de puntos dentro del bounding box.
+   *
+   * Mucho mejor que muestrear únicamente una diagonal porque un
+   * overlay de clickjacking puede cubrir solo una parte del elemento.
+   */
+  function sampleRectPoints(rect, gridSize = CONFIG.SAMPLE_GRID_SIZE) {
+    const pts = [];
+
+    if (
+      rect.width <= 0 ||
+      rect.height <= 0 ||
+      !Number.isFinite(rect.width) ||
+      !Number.isFinite(rect.height)
+    ) {
+      return pts;
+    }
+
+    for (let ix = 0; ix < gridSize; ix++) {
+      for (let iy = 0; iy < gridSize; iy++) {
+        const fx = (ix + 0.5) / gridSize;
+        const fy = (iy + 0.5) / gridSize;
+
+        pts.push([rect.left + rect.width * fx, rect.top + rect.height * fy]);
+      }
+    }
+
+    // Centro explícito.
+    pts.push([rect.left + rect.width / 2, rect.top + rect.height / 2]);
+
+    return pts;
+  }
+
   function isSentinelOverlay(el) {
     return el instanceof HTMLElement && el.hasAttribute("data-cjs-overlay");
   }
@@ -67,7 +105,9 @@ function main() {
   function looksLikeOverlay(el) {
     if (!(el instanceof HTMLElement) || isSentinelOverlay(el)) return false;
     const tag = el.tagName;
-    if (!["DIV", "SPAN", "SECTION", "LABEL", "ASIDE", "ARTICLE"].includes(tag)) {
+    if (
+      !["DIV", "SPAN", "SECTION", "LABEL", "ASIDE", "ARTICLE"].includes(tag)
+    ) {
       return false;
     }
     if (!isPointerActive(el)) return false;
@@ -80,24 +120,13 @@ function main() {
     return op <= 0.5 || pos === "fixed" || pos === "absolute" || z >= 10;
   }
 
-  function sampleRectPoints(rect, n) {
-    const pts = [];
-    for (let i = 0; i < n; i++) {
-      const fx = (i + 1) / (n + 1);
-      pts.push([rect.left + rect.width * fx, rect.top + rect.height * fx]);
-    }
-    // añade el centro exacto siempre
-    pts.push([rect.left + rect.width / 2, rect.top + rect.height / 2]);
-    return pts;
-  }
-
   function isCrossOriginFrame(el) {
     if (el.tagName !== "IFRAME") return false;
     try {
       // Si esto lanza excepción, es cross-origin (same-origin policy)
       void el.contentWindow.document;
       return false;
-    } catch (e) {
+    } catch {
       return true;
     }
   }
@@ -148,54 +177,155 @@ function main() {
   // punto hay otro elemento claramente visible/prominente?" — es decir, está
   // actuando como una máscara transparente sobre un señuelo visual.
 
-  function shadowingScore(el) {
-    const rect = el.getBoundingClientRect();
-    if (rect.width === 0 || rect.height === 0) return 0;
-    if (rect.top > innerHeight || rect.bottom < 0) return 0;
+  function shadowingScore(overlay) {
+    if (!(overlay instanceof HTMLElement)) {
+      return 0;
+    }
 
-    const opacity = getOpacity(el);
-    if (opacity > 0.5) return 0; // el mismo es visible, no es un "fantasma"
-    if (!isPointerActive(el)) return 0; // si no puede recibir eventos, no es amenaza
+    const overlayRect = overlay.getBoundingClientRect();
 
-    const points = sampleRectPoints(rect, CONFIG.SAMPLE_POINTS);
-    let shadowHits = 0;
-    for (const [x, y] of points) {
-      const stack = document.elementsFromPoint(x, y); // toda la pila, de arriba a abajo
-      const idx = stack.indexOf(el);
-      if (idx !== 0) continue; // el elemento debe ser quien realmente recibiría el click
+    if (
+      overlayRect.width <= 0 ||
+      overlayRect.height <= 0 ||
+      overlayRect.right <= 0 ||
+      overlayRect.bottom <= 0 ||
+      overlayRect.left >= innerWidth ||
+      overlayRect.top >= innerHeight
+    ) {
+      return 0;
+    }
 
-      for (let i = 1; i < stack.length; i++) {
-        const below = stack[i];
-        if (below === document.documentElement || below === document.body)
-          break;
-        const belowRect = below.getBoundingClientRect();
-        const belowOpacity = getOpacity(below);
-        if (
-          belowOpacity > 0.5 &&
-          belowRect.width > 10 &&
-          belowRect.height > 10
-        ) {
-          shadowHits++;
-          break;
+    const opacity = getOpacity(overlay);
+
+    // Solo nos interesa un overlay que sea difícil de ver.
+    if (opacity > 0.5) {
+      return 0;
+    }
+
+    // Debe poder recibir interacción.
+    if (!isPointerActive(overlay)) {
+      return 0;
+    }
+
+    let bestScore = 0;
+
+    for (const target of targetCandidates) {
+      if (!document.contains(target)) {
+        targetCandidates.delete(target);
+        continue;
+      }
+
+      if (target === overlay) {
+        continue;
+      }
+
+      const importance = visualTargetImportance(target);
+
+      if (importance <= 0) {
+        continue;
+      }
+
+      const targetRect = target.getBoundingClientRect();
+
+      const intersection = getRectIntersection(overlayRect, targetRect);
+
+      if (!intersection) {
+        continue;
+      }
+
+      const targetArea = targetRect.width * targetRect.height;
+
+      if (targetArea <= 0) {
+        continue;
+      }
+
+      // ¿Qué porcentaje del objetivo visible queda cubierto?
+      const coverage = intersection.area / targetArea;
+
+      if (coverage <= 0) {
+        continue;
+      }
+
+      /*
+       * Confirmamos que el overlay realmente está encima de esa zona
+       * y no solo comparte geometría. Usamos una rejilla (no solo la
+       * diagonal) porque un overlay puede cubrir únicamente una
+       * esquina o un borde del objetivo, no su centro.
+       */
+
+      const samplePoints = sampleRectPoints(intersection);
+
+      let overlayHits = 0;
+
+      for (const [x, y] of samplePoints) {
+        if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) {
+          continue;
+        }
+
+        const stack = document.elementsFromPoint(x, y);
+
+        if (stack[0] === overlay) {
+          overlayHits++;
         }
       }
+
+      const topRatio = overlayHits / samplePoints.length;
+
+      if (topRatio === 0) {
+        continue;
+      }
+
+      /*
+       * Score:
+       *
+       * coverage  -> cuánto del botón se tapa
+       * topRatio  -> qué tan frecuentemente el overlay está arriba
+       * importance -> qué tan importante parece el objetivo
+       */
+
+      const coverageScore = clamp01(coverage);
+
+      const geometricScore = coverageScore * 0.65 + topRatio * 0.35;
+
+      const targetScore = clamp01(geometricScore * importance);
+
+      bestScore = Math.max(bestScore, targetScore);
+
+      /*
+       * DEBUG útil durante la calibración.
+       */
+      console.debug("[Clickjack Sentinel] shadow candidate", {
+        overlay,
+        target,
+        coverage: Number(coverage.toFixed(3)),
+        topRatio: Number(topRatio.toFixed(3)),
+        importance: Number(importance.toFixed(3)),
+        targetScore: Number(targetScore.toFixed(3)),
+      });
     }
-    return clamp01(shadowHits / points.length);
+
+    return clamp01(bestScore);
   }
 
   // ---------- Heurística 2: opacidad casi nula pero interactivo ----------
-
+  // ---------- Opacidad + interacción ----------
   function lowOpacityActiveScore(el) {
     const op = getOpacity(el);
-    if (op <= CONFIG.OPACITY_SUSPECT_MAX && isPointerActive(el)) {
-      // entre más cerca de 0, más sospechoso
-      return clamp01(1 - op / CONFIG.OPACITY_SUSPECT_MAX) * 0.7 + 0.3;
+
+    if (!isPointerActive(el)) {
+      return 0;
     }
-    return 0;
+
+    if (op > CONFIG.OPACITY_SUSPECT_MAX) {
+      return 0;
+    }
+
+    // 0 opacity -> 1.0
+    // 0.15 opacity -> 0.3
+    return clamp01(1 - (op / CONFIG.OPACITY_SUSPECT_MAX) * 0.7);
   }
 
   // ---------- Heurística 3: iframe cross-origin superpuesto y semi-invisible ----------
-
   function crossOriginFrameScore(el) {
     if (!isCrossOriginFrame(el)) return 0;
     const op = getOpacity(el);
@@ -275,23 +405,198 @@ function main() {
     );
   }
 
+  // ---------- Score principal ----------
   function computeScore(el) {
-    const s = {
+    const breakdown = {
       shadowing: shadowingScore(el),
       lowOpacityActive: lowOpacityActiveScore(el),
       crossOriginFrame: crossOriginFrameScore(el),
       mouseFollowing: mouseFollowingScore(el),
       semanticMismatch: semanticMismatchScore(el),
     };
+
     let total = 0;
-    for (const k in s) total += s[k] * CONFIG.WEIGHTS[k];
-    return { total: clamp01(total), breakdown: s };
+
+    for (const key in breakdown) {
+      total += breakdown[key] * CONFIG.WEIGHTS[key];
+    }
+
+    total = clamp01(total);
+
+    // Estas se declaran como variables LOCALES primero (no como claves del
+    // objeto que retornamos) precisamente para poder reutilizarlas al
+    // calcular 'suspicious' más abajo. Un objeto literal no expone sus
+    // propias claves como variables dentro de sí mismo.
+    const semanticAlone = breakdown.semanticMismatch >= 0.7;
+
+    const strongShadowPattern =
+      breakdown.shadowing >= CONFIG.STRONG_SHADOW_THRESHOLD &&
+      breakdown.lowOpacityActive >= CONFIG.STRONG_LOW_OPACITY_THRESHOLD;
+
+    const strongIframePattern =
+      el.tagName === "IFRAME" &&
+      breakdown.lowOpacityActive >= 0.7 &&
+      breakdown.shadowing >= 0.35;
+
+    const strongClickjackingPattern =
+      el.tagName === "IFRAME" &&
+      breakdown.lowOpacityActive >= 0.7 &&
+      breakdown.shadowing >= 0.5;
+
+    const suspicious =
+      total >= CONFIG.SUSPICION_THRESHOLD ||
+      semanticAlone ||
+      strongShadowPattern ||
+      strongIframePattern;
+
+    return {
+      total,
+      breakdown,
+      strongShadowPattern,
+      strongIframePattern,
+      strongClickjackingPattern,
+      suspicious,
+    };
   }
 
   // ---------- Tracking de posición de elementos candidatos (para heurística de mouse-following) ----------
 
   const positionLog = new WeakMap();
   const candidates = new Set();
+  const targetCandidates = new Set();
+
+  //Así no dependemos de que el “señuelo” sea necesariamente un <button> real; también contemplamos enlaces, roles, onclick, etc.
+  //Esto complementa tu collectCandidates(), que actualmente mezcla overlays, iframes y objetivos en el mismo conjunto.
+  function collectVisualTargets() {
+    const selector = [
+      "a[href]",
+      "button",
+      '[role="button"]',
+      "[onclick]",
+      'input[type="submit"]',
+      'input[type="button"]',
+      'input[type="reset"]',
+      "div",
+      "span",
+    ].join(",");
+
+    document.querySelectorAll(selector).forEach((el) => {
+      if (!(el instanceof HTMLElement)) return;
+
+      if (
+        looksLikeVisualButton(el) ||
+        el.matches(
+          'a[href], button, [role="button"], [onclick], input[type="submit"], input[type="button"], input[type="reset"]',
+        )
+      ) {
+        targetCandidates.add(el);
+      }
+    });
+  }
+  function getRectIntersection(a, b) {
+    const left = Math.max(a.left, b.left);
+    const top = Math.max(a.top, b.top);
+    const right = Math.min(a.right, b.right);
+    const bottom = Math.min(a.bottom, b.bottom);
+
+    const width = right - left;
+    const height = bottom - top;
+
+    if (width <= 0 || height <= 0) {
+      return null;
+    }
+
+    return {
+      left,
+      top,
+      right,
+      bottom,
+      width,
+      height,
+      area: width * height,
+    };
+  }
+
+  function looksLikeVisualButton(el) {
+    if (!(el instanceof HTMLElement)) {
+      return false;
+    }
+
+    const text = (el.innerText || el.textContent || "").trim().toLowerCase();
+
+    if (!text) {
+      return false;
+    }
+
+    const words = [
+      "continuar",
+      "confirmar",
+      "descargar",
+      "aceptar",
+      "comprar",
+      "iniciar",
+      "verificar",
+      "obtener",
+      "seguir",
+    ];
+
+    return words.some((word) => text.includes(word));
+  }
+
+  function visualTargetImportance(el) {
+    if (!(el instanceof HTMLElement)) {
+      return 0;
+    }
+
+    const rect = el.getBoundingClientRect();
+
+    if (
+      rect.right <= 0 ||
+      rect.bottom <= 0 ||
+      rect.left >= innerWidth ||
+      rect.top >= innerHeight
+    ) {
+      return 0;
+    }
+
+    const cs = getComputedStyle(el);
+
+    if (
+      cs.display === "none" ||
+      cs.visibility === "hidden" ||
+      parseFloat(cs.opacity) <= 0.5
+    ) {
+      return 0;
+    }
+
+    switch (el.tagName) {
+      case "BUTTON":
+        return 1.0;
+
+      case "A":
+        return 0.95;
+
+      case "INPUT":
+        return 0.95;
+
+      default:
+        break;
+    }
+
+    if (looksLikeVisualButton(el) && rect.width >= 100 && rect.height >= 30) {
+      return 0.75;
+    }
+
+    if (el.matches('[role="button"]')) {
+      return 0.95;
+    }
+
+    if (el.hasAttribute("onclick")) {
+      return 0.85;
+    }
+
+    return 0.4;
+  }
 
   function collectOverlayHits() {
     // Lo que está realmente encima en el viewport (aunque sea un div sin href).
@@ -319,14 +624,22 @@ function main() {
   function collectCandidates() {
     const selector =
       'a[href], button, [onclick], [role="button"], iframe, input[type="submit"]';
+
     document.querySelectorAll(selector).forEach((el) => {
-      if (!isSentinelOverlay(el)) candidates.add(el);
+      if (!isSentinelOverlay(el)) {
+        candidates.add(el);
+      }
     });
+
     document
       .querySelectorAll("div[style], span[style], section[style], label[style]")
       .forEach((el) => {
-        if (looksLikeOverlay(el)) candidates.add(el);
+        if (looksLikeOverlay(el)) {
+          candidates.add(el);
+        }
       });
+
+    collectVisualTargets();
     collectOverlayHits();
   }
 
@@ -387,23 +700,44 @@ function main() {
   });
 
   // ---------- Evaluación periódica + en eventos de click reales ----------
-
+  // ---------- Evaluación ----------
   function evaluateAndReport(el, trigger) {
-    if (isSentinelOverlay(el)) return 0;
-    const { total, breakdown } = computeScore(el);
-    const semanticAlone = breakdown.semanticMismatch >= 0.7; // señal categóricamente distinta, no geométrica
-    if (
-      (total >= CONFIG.SUSPICION_THRESHOLD || semanticAlone) &&
-      !alreadyFlagged.has(el)
-    ) {
+    const {
+      total,
+      breakdown,
+      strongShadowPattern,
+      strongIframePattern,
+      strongClickjackingPattern,
+      suspicious,
+    } = computeScore(el);
+
+    // DEBUG durante calibración
+    console.debug("[Clickjack Sentinel]", {
+      element: el,
+      trigger,
+      total: Number(total.toFixed(3)),
+      breakdown,
+      strongShadowPattern,
+      strongIframePattern,
+    });
+
+    if (suspicious && !alreadyFlagged.has(el)) {
       alreadyFlagged.add(el);
+
       reportSuspect(
         el,
-        Math.max(total, breakdown.semanticMismatch),
+        Math.max(
+          total,
+          breakdown.semanticMismatch,
+          strongShadowPattern ? 0.75 : 0,
+          strongIframePattern ? 0.8 : 0,
+          strongClickjackingPattern ? 0.9 : 0,
+        ),
         breakdown,
         trigger,
       );
     }
+
     return total;
   }
 
@@ -467,8 +801,12 @@ function main() {
 
   function runHighlight(el, { intense, durationMs }) {
     try {
-      el.scrollIntoView({ behavior: "smooth", block: "center", inline: "nearest" });
-    } catch (_) {
+      el.scrollIntoView({
+        behavior: "smooth",
+        block: "center",
+        inline: "nearest",
+      });
+    } catch {
       /* elementos detached / SVG extraños */
     }
 
@@ -518,7 +856,9 @@ function main() {
     // Solo respondemos si lo encontramos: con all_frames:true varios frames
     // reciben el mensaje y el primero en responder gana. Si un frame vacío
     // contesta not_found antes, anularía un hit válido en un iframe.
-    const el = document.querySelector(`[data-cjs-id="${CSS.escape(msg.cjsId)}"]`);
+    const el = document.querySelector(
+      `[data-cjs-id="${CSS.escape(msg.cjsId)}"]`,
+    );
     if (!el) return;
 
     locateHighlight(el);
@@ -551,4 +891,4 @@ function main() {
 
   collectCandidates();
 }
-main ();
+main();
