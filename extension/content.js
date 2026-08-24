@@ -25,7 +25,7 @@ function main() {
       lowOpacityActive: 0.25, // opacidad casi nula pero pointer-events activo
       crossOriginFrame: 0.15, // iframe de otro origen superpuesto
       mouseFollowing: 0.15, // elemento cuya posición correlaciona con el cursor
-      semanticMismatch: 0.1, // texto ancla no relacionado con el dominio del href
+      ancestorOverlay: 0.1, // ancestro invisible/grande que captura la interacción
     },
     // Patrones que consideramos suficientemente fuertes por sí solos.
     STRONG_SHADOW_THRESHOLD: 0.45,
@@ -131,41 +131,66 @@ function main() {
     }
   }
 
-  function hrefDomain(href) {
-    try {
-      return new URL(href, location.href).hostname;
-    } catch {
-      return null;
+  // ---------- Evidencia de ancestros interactivos ----------
+
+  function getInteractiveAncestor(el, maxDepth = 8) {
+    let node = el?.parentElement || null;
+    let depth = 1;
+
+    while (node && depth <= maxDepth) {
+      if (
+        node instanceof HTMLElement &&
+        !isSentinelOverlay(node) &&
+        isPointerActive(node)
+      ) {
+        const rect = node.getBoundingClientRect();
+        const cs = getComputedStyle(node);
+        const opacity = parseFloat(cs.opacity);
+        const position = cs.position;
+        const z = parseInt(cs.zIndex, 10);
+
+        if (
+          rect.width > 0 &&
+          rect.height > 0 &&
+          Number.isFinite(opacity) &&
+          (opacity <= CONFIG.OPACITY_SUSPECT_MAX ||
+            position === "fixed" ||
+            position === "absolute" ||
+            z >= 1000)
+        ) {
+          return { node, depth, rect, cs, opacity };
+        }
+      }
+
+      node = node.parentElement;
+      depth += 1;
     }
+
+    return null;
   }
 
-  function semanticMismatchScore(el) {
-    if (el.tagName !== "A" || !el.href) return 0;
-    const text = (el.innerText || el.textContent || "").toLowerCase();
-    const linkDomain = hrefDomain(el.href);
-    const pageDomain = location.hostname;
-    if (!linkDomain) return 0;
+  function effectiveOpacity(el, maxDepth = 8) {
+    let opacity = 1;
+    let node = el;
+    let depth = 0;
 
-    // heurística simple: si el dominio del link no es el mismo que la página
-    // ni un subdominio, y el texto contiene palabras "de confianza" genéricas
-    // (descargar, oficial, pdf, factura, verificar) -> sube sospecha.
-    const trustWords = [
-      "descargar",
-      "oficial",
-      "pdf",
-      "factura",
-      "verificar",
-      "seguro",
-      "confirmar",
-      "documento",
-    ];
-    const sameSite =
-      linkDomain === pageDomain || linkDomain.endsWith("." + pageDomain);
-    const hasTrustWord = trustWords.some((w) => text.includes(w));
+    while (node && depth <= maxDepth) {
+      if (node instanceof HTMLElement) {
+        const value = getOpacity(node);
+        opacity *= value;
+        if (opacity <= CONFIG.OPACITY_SUSPECT_MAX) {
+          return opacity;
+        }
+      }
+      node = node.parentElement;
+      depth += 1;
+    }
 
-    if (!sameSite && hasTrustWord) return 0.9;
-    if (!sameSite) return 0.3;
-    return 0;
+    return clamp01(opacity);
+  }
+
+  function isDescendantOf(descendant, ancestor) {
+    return descendant === ancestor || ancestor.contains(descendant);
   }
 
   // ---------- Heurística 1: shadowing (el elemento tapa algo visible debajo) ----------
@@ -264,7 +289,12 @@ function main() {
 
         const stack = document.elementsFromPoint(x, y);
 
-        if (stack[0] === overlay) {
+        // El elemento que recibe realmente el click puede ser un descendiente
+        // del overlay (por ejemplo <a> dentro de un <div> fullscreen).
+        // Consideramos válido el punto si el overlay aparece en la cadena
+        // de ancestros del elemento superior de la pila.
+        const top = stack[0];
+        if (top && isDescendantOf(top, overlay)) {
           overlayHits++;
         }
       }
@@ -310,11 +340,11 @@ function main() {
   // ---------- Heurística 2: opacidad casi nula pero interactivo ----------
   // ---------- Opacidad + interacción ----------
   function lowOpacityActiveScore(el) {
-    const op = getOpacity(el);
-
     if (!isPointerActive(el)) {
       return 0;
     }
+
+    const op = effectiveOpacity(el);
 
     if (op > CONFIG.OPACITY_SUSPECT_MAX) {
       return 0;
@@ -323,6 +353,89 @@ function main() {
     // 0 opacity -> 1.0
     // 0.15 opacity -> 0.3
     return clamp01(1 - (op / CONFIG.OPACITY_SUSPECT_MAX) * 0.7);
+  }
+
+  // ---------- Heurística 3: ancestro invisible/grande que captura el click ----------
+  //
+  // Caso clave: <div style="position:fixed;inset:0;opacity:0.01">
+  //   <a href="..." style="display:block;height:inherit"></a>
+  // </div>
+  // El <a> es el target del evento, pero la evidencia peligrosa vive en el <div>.
+  function ancestorOverlayScore(el) {
+    if (!(el instanceof HTMLElement) || !isPointerActive(el)) {
+      return 0;
+    }
+
+    const ancestor = getInteractiveAncestor(el);
+    if (!ancestor) {
+      return 0;
+    }
+
+    const { node, rect, cs, opacity } = ancestor;
+    const viewportArea = Math.max(1, innerWidth * innerHeight);
+    const visibleLeft = Math.max(0, rect.left);
+    const visibleTop = Math.max(0, rect.top);
+    const visibleRight = Math.min(innerWidth, rect.right);
+    const visibleBottom = Math.min(innerHeight, rect.bottom);
+    const visibleWidth = Math.max(0, visibleRight - visibleLeft);
+    const visibleHeight = Math.max(0, visibleBottom - visibleTop);
+    const visibleArea = visibleWidth * visibleHeight;
+    const viewportCoverage = clamp01(visibleArea / viewportArea);
+
+    if (viewportCoverage <= 0) {
+      return 0;
+    }
+
+    // Comprueba que el ancestro realmente participa en la pila superior.
+    const points = sampleRectPoints(rect);
+    let captured = 0;
+
+    for (const [x, y] of points) {
+      if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) continue;
+      const stack = document.elementsFromPoint(x, y);
+      const top = stack[0];
+      if (top && isDescendantOf(top, node)) {
+        captured++;
+      }
+    }
+
+    const captureRatio = points.length ? captured / points.length : 0;
+    if (captureRatio === 0) {
+      return 0;
+    }
+
+    const hiddenScore = clamp01(
+      1 - Math.min(opacity, 1) / CONFIG.OPACITY_SUSPECT_MAX,
+    );
+
+    const fullscreenScore = viewportCoverage >= 0.9 ? 1 : viewportCoverage;
+    const positionedScore =
+      cs.position === "fixed"
+        ? 1
+        : cs.position === "absolute"
+          ? 0.85
+          : parseInt(cs.zIndex, 10) >= 1000
+            ? 0.75
+            : 0.25;
+
+    // La evidencia más fuerte es: muy invisible + ocupa casi todo + está arriba.
+    const score =
+      hiddenScore * 0.45 +
+      fullscreenScore * 0.25 +
+      captureRatio * 0.2 +
+      positionedScore * 0.1;
+
+    console.debug("[Clickjack Sentinel] ancestor overlay candidate", {
+      element: el,
+      ancestor: node,
+      opacity,
+      viewportCoverage: Number(viewportCoverage.toFixed(3)),
+      captureRatio: Number(captureRatio.toFixed(3)),
+      positionedScore: Number(positionedScore.toFixed(3)),
+      score: Number(score.toFixed(3)),
+    });
+
+    return clamp01(score);
   }
 
   // ---------- Heurística 3: iframe cross-origin superpuesto y semi-invisible ----------
@@ -385,8 +498,7 @@ function main() {
       }
     }
 
-    // Mapa de explicaciones. TODO: completa 'lowOpacityActive',
-    // 'crossOriginFrame', 'mouseFollowing' y 'semanticMismatch'.
+    // Mapa de explicaciones para las señales técnicas.
     // Pista: pregúntate "si un usuario sin conocimiento técnico viera
     // esto, ¿qué frase corta le ayudaría a entender el riesgo?"
     const explanations = {
@@ -396,7 +508,8 @@ function main() {
       crossOriginFrame:
         "Esta parte de la página en realidad pertenece a otro sitio",
       mouseFollowing: "Algo te esta siguiendo o a tu cursor",
-      semanticMismatch: "Dice una cosa pero te lleva a otra",
+      ancestorOverlay:
+        "Hay una capa invisible sobre la página que puede estar capturando tu click.",
     };
 
     return (
@@ -412,7 +525,7 @@ function main() {
       lowOpacityActive: lowOpacityActiveScore(el),
       crossOriginFrame: crossOriginFrameScore(el),
       mouseFollowing: mouseFollowingScore(el),
-      semanticMismatch: semanticMismatchScore(el),
+      ancestorOverlay: ancestorOverlayScore(el),
     };
 
     let total = 0;
@@ -422,12 +535,6 @@ function main() {
     }
 
     total = clamp01(total);
-
-    // Estas se declaran como variables LOCALES primero (no como claves del
-    // objeto que retornamos) precisamente para poder reutilizarlas al
-    // calcular 'suspicious' más abajo. Un objeto literal no expone sus
-    // propias claves como variables dentro de sí mismo.
-    const semanticAlone = breakdown.semanticMismatch >= 0.7;
 
     const strongShadowPattern =
       breakdown.shadowing >= CONFIG.STRONG_SHADOW_THRESHOLD &&
@@ -443,11 +550,15 @@ function main() {
       breakdown.lowOpacityActive >= 0.7 &&
       breakdown.shadowing >= 0.5;
 
+    const strongAncestorOverlayPattern =
+      breakdown.ancestorOverlay >= 0.65 &&
+      breakdown.lowOpacityActive >= 0.7;
+
     const suspicious =
       total >= CONFIG.SUSPICION_THRESHOLD ||
-      semanticAlone ||
       strongShadowPattern ||
-      strongIframePattern;
+      strongIframePattern ||
+      strongAncestorOverlayPattern;
 
     return {
       total,
@@ -455,6 +566,7 @@ function main() {
       strongShadowPattern,
       strongIframePattern,
       strongClickjackingPattern,
+      strongAncestorOverlayPattern,
       suspicious,
     };
   }
@@ -493,6 +605,7 @@ function main() {
       }
     });
   }
+
   function getRectIntersection(a, b) {
     const left = Math.max(a.left, b.left);
     const top = Math.max(a.top, b.top);
@@ -708,6 +821,7 @@ function main() {
       strongShadowPattern,
       strongIframePattern,
       strongClickjackingPattern,
+      strongAncestorOverlayPattern,
       suspicious,
     } = computeScore(el);
 
@@ -719,6 +833,7 @@ function main() {
       breakdown,
       strongShadowPattern,
       strongIframePattern,
+      strongAncestorOverlayPattern,
     });
 
     if (suspicious && !alreadyFlagged.has(el)) {
@@ -728,7 +843,7 @@ function main() {
         el,
         Math.max(
           total,
-          breakdown.semanticMismatch,
+          strongAncestorOverlayPattern ? 0.9 : 0,
           strongShadowPattern ? 0.75 : 0,
           strongIframePattern ? 0.8 : 0,
           strongClickjackingPattern ? 0.9 : 0,
