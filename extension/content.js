@@ -1,5 +1,5 @@
 /**
- * Clickjack Sentinel — content script
+ * CJS Estable
  *
  * Arquitectura: cada elemento potencialmente clickeable (<a href>, [onclick],
  * role="button", <button>, <iframe>) se evalúa contra 5 heurísticas.
@@ -24,7 +24,6 @@ function main() {
       lowOpacityActive: 0.25, // opacidad casi nula pero pointer-events activo
       crossOriginFrame: 0.15, // iframe de otro origen superpuesto
       mouseFollowing: 0.15, // elemento cuya posición correlaciona con el cursor
-      semanticMismatch: 0.1, // texto ancla no relacionado con el dominio del href
     },
   };
 
@@ -67,7 +66,9 @@ function main() {
   function looksLikeOverlay(el) {
     if (!(el instanceof HTMLElement) || isSentinelOverlay(el)) return false;
     const tag = el.tagName;
-    if (!["DIV", "SPAN", "SECTION", "LABEL", "ASIDE", "ARTICLE"].includes(tag)) {
+    if (
+      !["DIV", "SPAN", "SECTION", "LABEL", "ASIDE", "ARTICLE"].includes(tag)
+    ) {
       return false;
     }
     if (!isPointerActive(el)) return false;
@@ -100,43 +101,6 @@ function main() {
     } catch (e) {
       return true;
     }
-  }
-
-  function hrefDomain(href) {
-    try {
-      return new URL(href, location.href).hostname;
-    } catch {
-      return null;
-    }
-  }
-
-  function semanticMismatchScore(el) {
-    if (el.tagName !== "A" || !el.href) return 0;
-    const text = (el.innerText || el.textContent || "").toLowerCase();
-    const linkDomain = hrefDomain(el.href);
-    const pageDomain = location.hostname;
-    if (!linkDomain) return 0;
-
-    // heurística simple: si el dominio del link no es el mismo que la página
-    // ni un subdominio, y el texto contiene palabras "de confianza" genéricas
-    // (descargar, oficial, pdf, factura, verificar) -> sube sospecha.
-    const trustWords = [
-      "descargar",
-      "oficial",
-      "pdf",
-      "factura",
-      "verificar",
-      "seguro",
-      "confirmar",
-      "documento",
-    ];
-    const sameSite =
-      linkDomain === pageDomain || linkDomain.endsWith("." + pageDomain);
-    const hasTrustWord = trustWords.some((w) => text.includes(w));
-
-    if (!sameSite && hasTrustWord) return 0.9;
-    if (!sameSite) return 0.3;
-    return 0;
   }
 
   // ---------- Heurística 1: shadowing (el elemento tapa algo visible debajo) ----------
@@ -255,10 +219,7 @@ function main() {
       }
     }
 
-    // Mapa de explicaciones. TODO: completa 'lowOpacityActive',
-    // 'crossOriginFrame', 'mouseFollowing' y 'semanticMismatch'.
-    // Pista: pregúntate "si un usuario sin conocimiento técnico viera
-    // esto, ¿qué frase corta le ayudaría a entender el riesgo?"
+    // Mapa de explicaciones.
     const explanations = {
       shadowing:
         "Hay un elemento invisible cubriendo algo que parece un botón normal. Tu click podría no ir a donde crees.",
@@ -266,7 +227,6 @@ function main() {
       crossOriginFrame:
         "Esta parte de la página en realidad pertenece a otro sitio",
       mouseFollowing: "Algo te esta siguiendo o a tu cursor",
-      semanticMismatch: "Dice una cosa pero te lleva a otra",
     };
 
     return (
@@ -281,7 +241,6 @@ function main() {
       lowOpacityActive: lowOpacityActiveScore(el),
       crossOriginFrame: crossOriginFrameScore(el),
       mouseFollowing: mouseFollowingScore(el),
-      semanticMismatch: semanticMismatchScore(el),
     };
     let total = 0;
     for (const k in s) total += s[k] * CONFIG.WEIGHTS[k];
@@ -391,15 +350,14 @@ function main() {
   function evaluateAndReport(el, trigger) {
     if (isSentinelOverlay(el)) return 0;
     const { total, breakdown } = computeScore(el);
-    const semanticAlone = breakdown.semanticMismatch >= 0.7; // señal categóricamente distinta, no geométrica
     if (
-      (total >= CONFIG.SUSPICION_THRESHOLD || semanticAlone) &&
+      total >= CONFIG.SUSPICION_THRESHOLD &&
       !alreadyFlagged.has(el)
     ) {
       alreadyFlagged.add(el);
       reportSuspect(
         el,
-        Math.max(total, breakdown.semanticMismatch),
+        total,
         breakdown,
         trigger,
       );
@@ -467,7 +425,11 @@ function main() {
 
   function runHighlight(el, { intense, durationMs }) {
     try {
-      el.scrollIntoView({ behavior: "smooth", block: "center", inline: "nearest" });
+      el.scrollIntoView({
+        behavior: "smooth",
+        block: "center",
+        inline: "nearest",
+      });
     } catch (_) {
       /* elementos detached / SVG extraños */
     }
@@ -518,7 +480,9 @@ function main() {
     // Solo respondemos si lo encontramos: con all_frames:true varios frames
     // reciben el mensaje y el primero en responder gana. Si un frame vacío
     // contesta not_found antes, anularía un hit válido en un iframe.
-    const el = document.querySelector(`[data-cjs-id="${CSS.escape(msg.cjsId)}"]`);
+    const el = document.querySelector(
+      `[data-cjs-id="${CSS.escape(msg.cjsId)}"]`,
+    );
     if (!el) return;
 
     locateHighlight(el);
@@ -551,4 +515,4 @@ function main() {
 
   collectCandidates();
 }
-main ();
+main();
