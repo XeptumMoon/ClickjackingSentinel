@@ -10,7 +10,7 @@
  * para poder calibrar umbrales sin romper sitios legítimos.
  */
 
-(() => {
+function main() {
   console.log("[Clickjack Sentinel] content script cargado en", location.href);
 
   const CONFIG = {
@@ -550,4 +550,5 @@
   });
 
   collectCandidates();
-})();
+}
+main ();
